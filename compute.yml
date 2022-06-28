@@ -1,0 +1,215 @@
+Description: >
+    Autoscaling Group,Web Servers in Private Subnets and Load Balancer / Ozi Uzoma Udacity 2022
+
+Parameters:
+
+    EnvironmentName:
+        Description: An environment name that will be prefixed to resource names
+        Type: String
+    AMI:
+        Description: Amazon Image to be used
+        Type: String
+
+Resources:
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our load balancer
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-Project2VPC"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+
+  WebSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our hosts and SSH from local only
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-Project2VPC"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 0
+        ToPort: 65535
+        CidrIp: 0.0.0.0/0 
+      
+  JumpboxSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH access to troubleshoot private instances
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-Project2VPC"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 41.57.217.83/32 #MY public IP change it to suit yours
+  
+  Jumpbox:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AMI
+      InstanceType: t2.micro
+      KeyName: key
+      Tags: 
+         - Key: "Name"
+           Value: "Jumpbox"
+      NetworkInterfaces: 
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet: 
+            - Ref: "JumpboxSG"
+          SubnetId:
+            Fn::ImportValue:
+              !Sub "${EnvironmentName}-PUB1-SUB"     
+  
+  RoleEC2S3Read: 
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: Allow
+            Principal: 
+              Service: 
+                - ec2.amazonaws.com
+            Action: 
+              - "sts:AssumeRole"
+      RoleName: EC2S3ReadOnly
+      Path: "/"
+
+  RolePolicies: 
+    Type: AWS::IAM::Policy
+    Properties: 
+      PolicyName: AmazonS3ReadOnlyAccess
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action: "*"
+            Resource: "*"
+      Roles: 
+        - Ref: "RoleEC2S3Read"
+
+  InstanceProfile: 
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Path: "/"
+      Roles: 
+        - Ref: "RoleEC2S3Read"
+
+  WebAppLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo apt-get update -y
+          sudo apt-get install apache2 -y
+          sudo systemctl start apache2.service
+          cd /var/www/html
+          echo "It works! Udagram, Udacity" > index.html          
+      ImageId: !Ref AMI
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroups:
+      - Ref: WebSecGroup
+      InstanceType: t2.medium
+      BlockDeviceMappings:
+      - DeviceName: "/dev/sdk"
+        Ebs:
+          VolumeSize: '10'
+
+  WebAppGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - Fn::ImportValue: 
+          !Sub "${EnvironmentName}-PRIV-SUBNETS"
+      LaunchConfigurationName:
+        Ref: WebAppLaunchConfig
+      MinSize: '4'
+      MaxSize: '5'
+      TargetGroupARNs:
+      - Ref: WebTargetGroup
+      HealthCheckGracePeriod: 60
+      HealthCheckType: ELB
+
+  WebALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SUB"
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SUB"
+      SecurityGroups:
+      - Ref: LBSecGroup
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: WebTargetGroup
+      LoadBalancerArn:
+        Ref: WebALB
+      Port: '80'
+      Protocol: HTTP
+
+  ListenerRule:
+      Type: AWS::ElasticLoadBalancingV2::ListenerRule
+      Properties:
+        Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'WebTargetGroup'
+        Conditions:
+        - Field: path-pattern
+          Values: [/]
+        ListenerArn: !Ref 'Listener'
+        Priority: 1
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 8
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: 
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-Project2VPC"  
+
+Outputs: 
+
+    WebALB: 
+        Description: Loadbalancer ARN 
+        Value: !Ref WebALB
+        Export:
+          Name: !Sub ${EnvironmentName}-ALB
+
+    ALBDNSUrl:
+        Description: Application Load Balancer DNS Name 
+        Value: !GetAtt WebALB.DNSName
